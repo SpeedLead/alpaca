@@ -1,5 +1,4 @@
 .env
-README.md
 trailing_stop_state.json
 trailing_stop.log
 trailing_stop_monitor.sh
