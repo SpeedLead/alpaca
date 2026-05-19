@@ -75,7 +75,7 @@ Caveats:
 > - The trailing floor: if the stock goes up 10% from what I paid, move my stop loss up. Maybe move it up 5% below the current price every time it climbs. Move another 5% up the floor again, so the floor only goes up, never down.
 > - I want you to also ladder in: if the stock drops, let's say, by over 20~30%, buy a bunch more shares, let's say 10 more shares. If it drops by, let's say, 20%, buy 20 shares. This way I'm getting better prices on the way down instead of just losing money.
 >
-> After you set this up, show me a summary of every order and right after you place it so I can confirm this looks right.
+>   After you set this up, show me a summary of every order and right after you place it so I can confirm this looks right.
 
 > Hey, can you set up during market hours every day that you're checking consistently when we need to move our floor up or need to make new stop losses or re-enter? Use the /schedule to make sure we have that going and set your own schedules.
 
