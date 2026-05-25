@@ -18,6 +18,10 @@ current shares-held if the ladder filled, (c) replaces a stale stop order.
 Wash-trade workaround: Alpaca paper rejects a plain stop sell while opposite-
 side limit BUY orders sit below. We place a stop_limit (stop trigger, limit
 floor 1.2% below trigger) instead.
+
+Usage:
+    tsla_trailing_stop.py             # one monitor tick
+    tsla_trailing_stop.py --flatten   # panic button: cancel orders, market-sell
 """
 
 from __future__ import annotations
@@ -78,20 +82,50 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+class ApiError(Exception):
+    def __init__(self, status: int | None, body: Any):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body}")
+
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
 def api(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    """Call Alpaca. Returns parsed JSON on 2xx. Raises ApiError on hard failure.
+
+    Retries 429 / 5xx and network errors with linear backoff (3 attempts total).
+    Callers that need to handle a specific 4xx (e.g. 404 "no position") should
+    catch ApiError and branch on `e.status` / `e.body`.
+    """
     url = f"{BASE_URL}/{path.lstrip('/')}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, headers=HEADERS, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else None
-    except urllib.error.HTTPError as e:
-        body_txt = e.read().decode(errors="replace")
+    last: tuple[int | None, Any] = (None, "no attempts")
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, headers=HEADERS, method=method)
         try:
-            return json.loads(body_txt)
-        except Exception:
-            return {"_http_error": e.code, "_body": body_txt}
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            body_txt = e.read().decode(errors="replace")
+            try:
+                parsed = json.loads(body_txt)
+            except Exception:
+                parsed = body_txt
+            last = (e.code, parsed)
+            if e.code in RETRY_STATUSES and attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise ApiError(e.code, parsed) from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            last = (None, str(e))
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise ApiError(None, str(e)) from e
+    raise ApiError(*last)
 
 
 @dataclass
@@ -129,10 +163,12 @@ def market_open() -> bool:
 
 
 def get_position() -> dict[str, Any] | None:
-    pos = api("GET", f"positions/{SYMBOL}")
-    if isinstance(pos, dict) and pos.get("code") == 40410000:
-        return None  # no position
-    return pos
+    try:
+        return api("GET", f"positions/{SYMBOL}")
+    except ApiError as e:
+        if e.status == 404 and isinstance(e.body, dict) and e.body.get("code") == 40410000:
+            return None
+        raise
 
 
 def get_order(order_id: str) -> dict[str, Any]:
@@ -140,7 +176,23 @@ def get_order(order_id: str) -> dict[str, Any]:
 
 
 def cancel_order(order_id: str) -> None:
-    api("DELETE", f"orders/{order_id}")
+    """Cancel an order. Tolerates 404/422 (order already in a terminal state)."""
+    try:
+        api("DELETE", f"orders/{order_id}")
+    except ApiError as e:
+        if e.status in (404, 422):
+            return
+        raise
+
+
+def replace_order(order_id: str, **fields: str) -> dict[str, Any] | None:
+    """PATCH a resting order in place. Atomic broker-side. Returns the NEW order
+    dict (with new id) on success, or None on failure."""
+    try:
+        return api("PATCH", f"orders/{order_id}", dict(fields))
+    except ApiError as e:
+        log(f"  !! replace {order_id[:8]} failed: HTTP {e.status} {e.body}")
+        return None
 
 
 def place_protective_stop(qty: int, stop_price: float) -> str | None:
@@ -155,44 +207,76 @@ def place_protective_stop(qty: int, stop_price: float) -> str | None:
         "limit_price": f"{stop_price * (1 - STOP_LIMIT_BUFFER):.2f}",
         "position_intent": "sell_to_close",
     }
-    resp = api("POST", "orders", body)
-    if "id" in resp:
-        log(
-            f"  -> placed stop_limit {resp['id'][:8]}: {qty} sh, "
-            f"stop ${body['stop_price']} / limit ${body['limit_price']}"
-        )
-        return resp["id"]
-    log(f"  !! stop placement FAILED: {resp}")
-    return None
+    try:
+        resp = api("POST", "orders", body)
+    except ApiError as e:
+        log(f"  !! stop placement FAILED: HTTP {e.status} {e.body}")
+        return None
+    log(
+        f"  -> placed stop_limit {resp['id'][:8]}: {qty} sh, "
+        f"stop ${body['stop_price']} / limit ${body['limit_price']}"
+    )
+    return resp["id"]
 
 
 def reconcile_stop(state: State, qty: int, desired_stop: float) -> None:
-    """Make the resting stop order match `qty` and `desired_stop`."""
-    existing = None
+    """Make the resting stop order match `qty` and `desired_stop`.
+
+    Prefers PATCH /orders/{id} (broker-side atomic) when an order is already
+    resting; only falls back to cancel-then-place if PATCH fails. `current_stop`
+    is updated only after a successful placement, so a failed run leaves state
+    consistent with what's actually live on the broker.
+    """
+    existing: dict[str, Any] | None = None
     if state.stop_order_id:
-        existing = get_order(state.stop_order_id)
+        try:
+            existing = get_order(state.stop_order_id)
+        except ApiError as e:
+            log(f"  could not read stop {state.stop_order_id[:8]}: HTTP {e.status}")
+            existing = None
         status = (existing or {}).get("status")
-        if status not in ("new", "accepted", "held", "pending_new"):
+        if existing is not None and status not in ("new", "accepted", "held", "pending_new"):
             log(f"  stop {state.stop_order_id[:8]} status={status}, replacing")
             existing = None
             state.stop_order_id = None
 
-    needs_replace = (
-        existing is None
-        or int(float(existing.get("qty", 0))) != qty
-        or abs(float(existing.get("stop_price", 0)) - desired_stop) > 0.01
-    )
-    if not needs_replace:
+    if existing is None:
+        new_id = place_protective_stop(qty, desired_stop)
+        if new_id is not None:
+            state.stop_order_id = new_id
+            state.current_stop = desired_stop
         return
 
-    if state.stop_order_id:
-        cancel_order(state.stop_order_id)
-        log(f"  canceled stop {state.stop_order_id[:8]}")
-        state.stop_order_id = None
+    qty_ok = int(float(existing.get("qty", 0))) == qty
+    stop_ok = abs(float(existing.get("stop_price", 0)) - desired_stop) < 0.01
+    if qty_ok and stop_ok:
+        return
 
+    new_limit = round(desired_stop * (1 - STOP_LIMIT_BUFFER), 2)
+    replaced = replace_order(
+        state.stop_order_id,
+        qty=str(qty),
+        stop_price=f"{desired_stop:.2f}",
+        limit_price=f"{new_limit:.2f}",
+    )
+    if replaced and "id" in replaced:
+        log(
+            f"  -> replaced stop {state.stop_order_id[:8]} -> {replaced['id'][:8]}: "
+            f"{qty} sh, stop ${desired_stop:.2f}"
+        )
+        state.stop_order_id = replaced["id"]
+        state.current_stop = desired_stop
+        return
+
+    # Fall back to cancel+place. Brief window with no resting stop.
+    log("  PATCH failed; falling back to cancel+place")
+    cancel_order(state.stop_order_id)
+    log(f"  canceled stop {state.stop_order_id[:8]}")
+    state.stop_order_id = None
     new_id = place_protective_stop(qty, desired_stop)
-    state.stop_order_id = new_id
-    state.current_stop = desired_stop
+    if new_id is not None:
+        state.stop_order_id = new_id
+        state.current_stop = desired_stop
 
 
 def reconcile_ladder(state: State, entry_price: float) -> None:
@@ -226,12 +310,12 @@ def reconcile_ladder(state: State, entry_price: float) -> None:
             "time_in_force": "gtc",
             "limit_price": f"{limit_price:.2f}",
         }
-        resp = api("POST", "orders", body)
-        if "id" in resp:
+        try:
+            resp = api("POST", "orders", body)
             state.ladder_order_ids[key] = resp["id"]
             log(f"  -> placed ladder {key}: {qty} sh @ ${limit_price}")
-        else:
-            log(f"  !! ladder {key} placement FAILED: {resp}")
+        except ApiError as e:
+            log(f"  !! ladder {key} placement FAILED: HTTP {e.status} {e.body}")
 
 
 def run_once() -> int:
@@ -286,6 +370,54 @@ def run_once() -> int:
     return 0
 
 
+def flatten() -> int:
+    """Panic button: cancel all open orders for SYMBOL and market-sell the
+    position. Outside market hours, the market sell queues for the next open."""
+    log("=== FLATTEN initiated ===")
+    try:
+        open_orders = api("GET", f"orders?status=open&symbols={SYMBOL}") or []
+    except ApiError as e:
+        log(f"  !! could not list orders: HTTP {e.status} {e.body}")
+        return 1
+    for o in open_orders:
+        try:
+            cancel_order(o["id"])
+            log(f"  canceled {o['side']} {o['type']} {o['id'][:8]}")
+        except ApiError as e:
+            log(f"  !! cancel {o['id'][:8]} failed: HTTP {e.status} {e.body}")
+
+    try:
+        pos = get_position()
+    except ApiError as e:
+        log(f"  !! could not read position: HTTP {e.status} {e.body}")
+        return 1
+
+    if pos is None or int(float(pos.get("qty", 0))) == 0:
+        log("No position to close.")
+    else:
+        qty = int(float(pos["qty"]))
+        body = {
+            "symbol": SYMBOL,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day",
+            "position_intent": "sell_to_close",
+        }
+        try:
+            resp = api("POST", "orders", body)
+            log(f"  -> market sell {qty} sh queued: order {resp['id'][:8]}")
+        except ApiError as e:
+            log(f"  !! market sell FAILED: HTTP {e.status} {e.body}")
+            return 1
+
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+        log("State file cleared.")
+    log("=== FLATTEN complete ===")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if "--help" in argv or "-h" in argv:
         print(__doc__)
@@ -297,6 +429,8 @@ def main(argv: list[str]) -> int:
         except BlockingIOError:
             log("Another instance is running; skipping.")
             return 0
+        if "--flatten" in argv:
+            return flatten()
         return run_once()
 
 

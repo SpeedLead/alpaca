@@ -4,7 +4,7 @@ Automated trailing-stop + ladder-buy strategy on Tesla, running against an Alpac
 
 ## Strategy
 
-- **Entry:** 10-share market buy of TSLA (already filled at `$385.64`; position now 11 shares avg `$386.23` after a 1-share test buy).
+- **Entry:** 10-share market buy of TSLA at the prevailing price.
 - **Hard floor:** stop-loss at `entry × 0.90` (−10%) — limits loss on a fast drop.
 - **Trailing floor:** once price reaches `entry × 1.10` (+10%), trailing activates. Stop moves to `peak × 0.95` and **only moves UP, never down**.
 - **Ladder buys** (limit, GTC):
@@ -41,14 +41,14 @@ launchctl kickstart "gui/$(id -u)/com.user.tsla-trailing-stop"
 # tail the app log
 tail -f trailing_stop.log
 
-# pause / resume the schedule
+# stop / reload the schedule (bootout unloads the agent, bootstrap reloads it)
 launchctl bootout   "gui/$(id -u)/com.user.tsla-trailing-stop"
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.user.tsla-trailing-stop.plist
 ```
 
 ## How the schedule works
 
-`launchd` invokes the script through `/bin/zsh -c "..."` every 900 s. The shell wrapper exists because macOS TCC blocks `launchd` from directly spawning processes that read `~/Desktop`; routing through the user-context shell sidesteps it. For the same reason, launchd's stdout/stderr is redirected to `~/Library/Logs/` (not TCC-protected) while the script's own logger continues writing to `trailing_stop.log` on Desktop.
+`launchd` invokes the script through `/bin/zsh -c "..."` every 900 seconds (15 min). The shell wrapper exists because macOS TCC blocks `launchd` from directly spawning processes that read `~/Desktop`; routing through the user-context shell sidesteps it. For the same reason, launchd's stdout/stderr is redirected to `~/Library/Logs/` (not TCC-protected) while the script's own logger continues writing to `trailing_stop.log` on Desktop.
 
 Caveats:
 - The job only fires while the Mac is awake. Keep it plugged in (or use `caffeinate`) during market hours.
